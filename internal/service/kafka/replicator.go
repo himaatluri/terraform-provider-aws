@@ -65,7 +65,7 @@ func resourceReplicator() *schema.Resource {
 				},
 				"kafka_cluster": {
 					Type:     schema.TypeList,
-					Required: true,
+					Optional: true,
 					ForceNew: true,
 					MinItems: 2,
 					MaxItems: 2,
@@ -73,7 +73,7 @@ func resourceReplicator() *schema.Resource {
 						Schema: map[string]*schema.Schema{
 							"amazon_msk_cluster": {
 								Type:     schema.TypeList,
-								Required: true,
+								Optional: true,
 								MaxItems: 1,
 								Elem: &schema.Resource{
 									Schema: map[string]*schema.Schema{
@@ -85,9 +85,81 @@ func resourceReplicator() *schema.Resource {
 									},
 								},
 							},
+							"apache_kafka_cluster": {
+								Type:     schema.TypeList,
+								Optional: true,
+								ForceNew: true,
+								MaxItems: 1,
+								Elem: &schema.Resource{
+									Schema: map[string]*schema.Schema{
+										"apache_kafka_cluster_id": {
+											Type:     schema.TypeString,
+											Required: true,
+											ForceNew: true,
+										},
+										"bootstrap_broker_string": {
+											Type:     schema.TypeString,
+											Required: true,
+											ForceNew: true,
+										},
+									},
+								},
+							},
+							"client_authentication": {
+								Type:     schema.TypeList,
+								Optional: true,
+								ForceNew: true,
+								MaxItems: 1,
+								Elem: &schema.Resource{
+									Schema: map[string]*schema.Schema{
+										"sasl_scram": {
+											Type:     schema.TypeList,
+											Required: true,
+											MaxItems: 1,
+											Elem: &schema.Resource{
+												Schema: map[string]*schema.Schema{
+													"mechanism": {
+														Type:             schema.TypeString,
+														Required:         true,
+														ForceNew:         true,
+														ValidateDiagFunc: enum.Validate[types.KafkaClusterSaslScramMechanism](),
+													},
+													"secret_arn": {
+														Type:         schema.TypeString,
+														Required:     true,
+														ForceNew:     true,
+														ValidateFunc: verify.ValidARN,
+													},
+												},
+											},
+										},
+									},
+								},
+							},
+							"encryption_in_transit": {
+								Type:     schema.TypeList,
+								Optional: true,
+								ForceNew: true,
+								MaxItems: 1,
+								Elem: &schema.Resource{
+									Schema: map[string]*schema.Schema{
+										"encryption_type": {
+											Type:             schema.TypeString,
+											Required:         true,
+											ForceNew:         true,
+											ValidateDiagFunc: enum.Validate[types.KafkaClusterEncryptionInTransitType](),
+										},
+										"root_ca_certificate": {
+											Type:     schema.TypeString,
+											Optional: true,
+											ForceNew: true,
+										},
+									},
+								},
+							},
 							names.AttrVPCConfig: {
 								Type:     schema.TypeList,
-								Required: true,
+								Optional: true,
 								MaxItems: 1,
 								Elem: &schema.Resource{
 									Schema: map[string]*schema.Schema{
@@ -198,9 +270,14 @@ func resourceReplicator() *schema.Resource {
 							},
 							"source_kafka_cluster_arn": {
 								Type:         schema.TypeString,
-								Required:     true,
+								Optional:     true,
 								ForceNew:     true,
 								ValidateFunc: verify.ValidARN,
+							},
+							"source_kafka_cluster_id": {
+								Type:     schema.TypeString,
+								Optional: true,
+								ForceNew: true,
 							},
 							"target_compression_type": {
 								Type:     schema.TypeString,
@@ -213,9 +290,14 @@ func resourceReplicator() *schema.Resource {
 							},
 							"target_kafka_cluster_arn": {
 								Type:         schema.TypeString,
-								Required:     true,
+								Optional:     true,
 								ForceNew:     true,
 								ValidateFunc: verify.ValidARN,
+							},
+							"target_kafka_cluster_id": {
+								Type:     schema.TypeString,
+								Optional: true,
+								ForceNew: true,
 							},
 							"topic_replication": {
 								Type:     schema.TypeList,
@@ -366,6 +448,75 @@ func resourceReplicator() *schema.Resource {
 
 				return nil
 			},
+			func(_ context.Context, d *schema.ResourceDiff, _ any) error {
+				var diags diag.Diagnostics
+
+				// Validate kafka_cluster entries.
+				apacheCount := 0
+				for i := 0; i < 2; i++ {
+					prefix := fmt.Sprintf("kafka_cluster.%d", i)
+					hasMsk := len(d.Get(fmt.Sprintf("%s.amazon_msk_cluster", prefix)).([]any)) > 0
+					hasApache := len(d.Get(fmt.Sprintf("%s.apache_kafka_cluster", prefix)).([]any)) > 0
+
+					if !hasMsk && !hasApache {
+						diags = sdkdiag.AppendErrorf(diags, "kafka_cluster.%d must specify either amazon_msk_cluster or apache_kafka_cluster", i)
+					}
+					if hasMsk && hasApache {
+						diags = sdkdiag.AppendErrorf(diags, "kafka_cluster.%d cannot specify both amazon_msk_cluster and apache_kafka_cluster", i)
+					}
+					if hasApache {
+						apacheCount++
+						if len(d.Get(fmt.Sprintf("%s.client_authentication", prefix)).([]any)) == 0 {
+							diags = sdkdiag.AppendErrorf(diags, "kafka_cluster.%d requires client_authentication when using apache_kafka_cluster", i)
+						}
+						if len(d.Get(fmt.Sprintf("%s.encryption_in_transit", prefix)).([]any)) == 0 {
+							diags = sdkdiag.AppendErrorf(diags, "kafka_cluster.%d requires encryption_in_transit when using apache_kafka_cluster", i)
+						}
+					}
+					if hasMsk {
+						if len(d.Get(fmt.Sprintf("%s.client_authentication", prefix)).([]any)) > 0 {
+							diags = sdkdiag.AppendErrorf(diags, "kafka_cluster.%d cannot specify client_authentication with amazon_msk_cluster", i)
+						}
+						if len(d.Get(fmt.Sprintf("%s.encryption_in_transit", prefix)).([]any)) > 0 {
+							diags = sdkdiag.AppendErrorf(diags, "kafka_cluster.%d cannot specify encryption_in_transit with amazon_msk_cluster", i)
+						}
+					}
+				}
+				if apacheCount == 2 {
+					diags = sdkdiag.AppendErrorf(diags, "at least one kafka_cluster must be an amazon_msk_cluster")
+				}
+
+				// Validate replication_info_list source/target identifiers.
+				// NewValueKnown returns false for computed/unknown values at plan time.
+				// Skip validation when values are unknown (e.g., referencing another resource's ARN).
+				sourceArnKnown := d.NewValueKnown("replication_info_list.0.source_kafka_cluster_arn")
+				sourceIDKnown := d.NewValueKnown("replication_info_list.0.source_kafka_cluster_id")
+				sourceArn := d.Get("replication_info_list.0.source_kafka_cluster_arn").(string)
+				sourceID := d.Get("replication_info_list.0.source_kafka_cluster_id").(string)
+				if sourceArnKnown && sourceIDKnown && sourceArn == "" && sourceID == "" {
+					diags = sdkdiag.AppendErrorf(diags, "must specify either source_kafka_cluster_arn or source_kafka_cluster_id")
+				}
+				if sourceArn != "" && sourceID != "" {
+					diags = sdkdiag.AppendErrorf(diags, "cannot specify both source_kafka_cluster_arn and source_kafka_cluster_id")
+				}
+
+				targetArnKnown := d.NewValueKnown("replication_info_list.0.target_kafka_cluster_arn")
+				targetIDKnown := d.NewValueKnown("replication_info_list.0.target_kafka_cluster_id")
+				targetArn := d.Get("replication_info_list.0.target_kafka_cluster_arn").(string)
+				targetID := d.Get("replication_info_list.0.target_kafka_cluster_id").(string)
+				if targetArnKnown && targetIDKnown && targetArn == "" && targetID == "" {
+					diags = sdkdiag.AppendErrorf(diags, "must specify either target_kafka_cluster_arn or target_kafka_cluster_id")
+				}
+				if targetArn != "" && targetID != "" {
+					diags = sdkdiag.AppendErrorf(diags, "cannot specify both target_kafka_cluster_arn and target_kafka_cluster_id")
+				}
+
+				if diags.HasError() {
+					return sdkdiag.DiagnosticsError(diags)
+				}
+
+				return nil
+			},
 		),
 	}
 }
@@ -435,16 +586,26 @@ func resourceReplicatorRead(ctx context.Context, d *schema.ResourceData, meta an
 	if v := output.ReplicationInfoList; len(v) > 0 {
 		sourceAlias, targetAlias := aws.ToString(v[0].SourceKafkaClusterAlias), aws.ToString(v[0].TargetKafkaClusterAlias)
 		var sourceARN, targetARN *string
+		var sourceID, targetID *string
 
 		for _, cluster := range output.KafkaClusters {
-			if clusterAlias := aws.ToString(cluster.KafkaClusterAlias); clusterAlias == sourceAlias {
-				sourceARN = cluster.AmazonMskCluster.MskClusterArn
+			clusterAlias := aws.ToString(cluster.KafkaClusterAlias)
+			if clusterAlias == sourceAlias {
+				if cluster.AmazonMskCluster != nil {
+					sourceARN = cluster.AmazonMskCluster.MskClusterArn
+				} else if cluster.ApacheKafkaCluster != nil {
+					sourceID = cluster.ApacheKafkaCluster.ApacheKafkaClusterId
+				}
 			} else if clusterAlias == targetAlias {
-				targetARN = cluster.AmazonMskCluster.MskClusterArn
+				if cluster.AmazonMskCluster != nil {
+					targetARN = cluster.AmazonMskCluster.MskClusterArn
+				} else if cluster.ApacheKafkaCluster != nil {
+					targetID = cluster.ApacheKafkaCluster.ApacheKafkaClusterId
+				}
 			}
 		}
 
-		if err := d.Set("replication_info_list", flattenReplicationInfoDescriptions(v, sourceARN, targetARN)); err != nil {
+		if err := d.Set("replication_info_list", flattenReplicationInfoDescriptions(v, sourceARN, targetARN, sourceID, targetID)); err != nil {
 			return sdkdiag.AppendErrorf(diags, "setting replication_info_list: %s", err)
 		}
 	} else {
@@ -464,11 +625,22 @@ func resourceReplicatorUpdate(ctx context.Context, d *schema.ResourceData, meta 
 	conn := meta.(*conns.AWSClient).KafkaClient(ctx)
 
 	if d.HasChangesExcept(names.AttrTags, names.AttrTagsAll) {
-		input := kafka.UpdateReplicationInfoInput{
-			CurrentVersion:        aws.String(d.Get("current_version").(string)),
-			ReplicatorArn:         aws.String(d.Id()),
-			SourceKafkaClusterArn: aws.String(d.Get("replication_info_list.0.source_kafka_cluster_arn").(string)),
-			TargetKafkaClusterArn: aws.String(d.Get("replication_info_list.0.target_kafka_cluster_arn").(string)),
+		input := &kafka.UpdateReplicationInfoInput{
+			CurrentVersion: aws.String(d.Get("current_version").(string)),
+			ReplicatorArn:  aws.String(d.Id()),
+		}
+
+		if v, ok := d.GetOk("replication_info_list.0.source_kafka_cluster_arn"); ok {
+			input.SourceKafkaClusterArn = aws.String(v.(string))
+		}
+		if v, ok := d.GetOk("replication_info_list.0.source_kafka_cluster_id"); ok {
+			input.SourceKafkaClusterId = aws.String(v.(string))
+		}
+		if v, ok := d.GetOk("replication_info_list.0.target_kafka_cluster_arn"); ok {
+			input.TargetKafkaClusterArn = aws.String(v.(string))
+		}
+		if v, ok := d.GetOk("replication_info_list.0.target_kafka_cluster_id"); ok {
+			input.TargetKafkaClusterId = aws.String(v.(string))
 		}
 
 		if d.HasChanges("log_delivery") {
@@ -487,7 +659,7 @@ func resourceReplicatorUpdate(ctx context.Context, d *schema.ResourceData, meta 
 			}
 		}
 
-		_, err := conn.UpdateReplicationInfo(ctx, &input)
+		_, err := conn.UpdateReplicationInfo(ctx, input)
 
 		if err != nil {
 			return sdkdiag.AppendErrorf(diags, "updating MSK Replicator (%s): %s", d.Id(), err)
@@ -630,7 +802,7 @@ func findReplicator(ctx context.Context, conn *kafka.Client, input *kafka.Descri
 	return output, nil
 }
 
-func flattenReplicationInfoDescriptions(apiObjects []types.ReplicationInfoDescription, sourceCluster, targetCluster *string) []any {
+func flattenReplicationInfoDescriptions(apiObjects []types.ReplicationInfoDescription, sourceCluster, targetCluster, sourceClusterID, targetClusterID *string) []any {
 	if len(apiObjects) == 0 {
 		return nil
 	}
@@ -638,13 +810,13 @@ func flattenReplicationInfoDescriptions(apiObjects []types.ReplicationInfoDescri
 	var tfList []any
 
 	for _, apiObject := range apiObjects {
-		tfList = append(tfList, flattenReplicationInfoDescription(apiObject, sourceCluster, targetCluster))
+		tfList = append(tfList, flattenReplicationInfoDescription(apiObject, sourceCluster, targetCluster, sourceClusterID, targetClusterID))
 	}
 
 	return tfList
 }
 
-func flattenReplicationInfoDescription(apiObject types.ReplicationInfoDescription, sourceCluster, targetCluster *string) map[string]any {
+func flattenReplicationInfoDescription(apiObject types.ReplicationInfoDescription, sourceCluster, targetCluster, sourceClusterID, targetClusterID *string) map[string]any {
 	tfMap := map[string]any{}
 
 	if v := sourceCluster; v != nil {
@@ -653,6 +825,14 @@ func flattenReplicationInfoDescription(apiObject types.ReplicationInfoDescriptio
 
 	if v := targetCluster; v != nil {
 		tfMap["target_kafka_cluster_arn"] = aws.ToString(v)
+	}
+
+	if v := sourceClusterID; v != nil {
+		tfMap["source_kafka_cluster_id"] = aws.ToString(v)
+	}
+
+	if v := targetClusterID; v != nil {
+		tfMap["target_kafka_cluster_id"] = aws.ToString(v)
 	}
 
 	if v := apiObject.SourceKafkaClusterAlias; v != nil {
@@ -791,6 +971,18 @@ func flattenKafkaClusterDescription(apiObject types.KafkaClusterDescription) map
 		tfMap["amazon_msk_cluster"] = []any{flattenAmazonMSKCluster(v)}
 	}
 
+	if v := apiObject.ApacheKafkaCluster; v != nil {
+		tfMap["apache_kafka_cluster"] = flattenApacheKafkaCluster(v)
+	}
+
+	if v := apiObject.ClientAuthentication; v != nil {
+		tfMap["client_authentication"] = flattenKafkaClusterClientAuthentication(v)
+	}
+
+	if v := apiObject.EncryptionInTransit; v != nil {
+		tfMap["encryption_in_transit"] = flattenKafkaClusterEncryptionInTransit(v)
+	}
+
 	if v := apiObject.VpcConfig; v != nil {
 		tfMap[names.AttrVPCConfig] = []any{flattenKafkaClusterClientVPCConfig(v)}
 	}
@@ -826,6 +1018,63 @@ func flattenAmazonMSKCluster(apiObject *types.AmazonMskCluster) map[string]any {
 	}
 
 	return tfMap
+}
+
+func flattenApacheKafkaCluster(apiObject *types.ApacheKafkaCluster) []any {
+	if apiObject == nil {
+		return nil
+	}
+
+	tfMap := map[string]any{}
+
+	if v := apiObject.ApacheKafkaClusterId; v != nil {
+		tfMap["apache_kafka_cluster_id"] = aws.ToString(v)
+	}
+
+	if v := apiObject.BootstrapBrokerString; v != nil {
+		tfMap["bootstrap_broker_string"] = aws.ToString(v)
+	}
+
+	return []any{tfMap}
+}
+
+func flattenKafkaClusterClientAuthentication(apiObject *types.KafkaClusterClientAuthentication) []any { // nosemgrep:ci.kafka-in-func-name
+	if apiObject == nil {
+		return nil
+	}
+
+	tfMap := map[string]any{}
+
+	if v := apiObject.SaslScram; v != nil {
+		scram := map[string]any{}
+		if v.Mechanism != "" {
+			scram["mechanism"] = string(v.Mechanism)
+		}
+		if v.SecretArn != nil {
+			scram["secret_arn"] = aws.ToString(v.SecretArn)
+		}
+		tfMap["sasl_scram"] = []any{scram}
+	}
+
+	return []any{tfMap}
+}
+
+func flattenKafkaClusterEncryptionInTransit(apiObject *types.KafkaClusterEncryptionInTransit) []any { // nosemgrep:ci.kafka-in-func-name
+	if apiObject == nil {
+		return nil
+	}
+
+	tfMap := map[string]any{}
+
+	if v := apiObject.EncryptionType; v != "" {
+		tfMap["encryption_type"] = string(v)
+	}
+
+	if v := apiObject.RootCaCertificate; v != nil {
+		tfMap["root_ca_certificate"] = aws.ToString(v)
+	}
+
+	return []any{tfMap}
 }
 
 func flattenLogDelivery(apiObject *types.LogDelivery) []any {
@@ -989,12 +1238,20 @@ func expandReplicationInfos(tfList []any) []types.ReplicationInfo {
 func expandReplicationInfo(tfMap map[string]any) types.ReplicationInfo {
 	apiObject := types.ReplicationInfo{}
 
-	if v, ok := tfMap["source_kafka_cluster_arn"].(string); ok {
+	if v, ok := tfMap["source_kafka_cluster_arn"].(string); ok && v != "" {
 		apiObject.SourceKafkaClusterArn = aws.String(v)
 	}
 
-	if v, ok := tfMap["target_kafka_cluster_arn"].(string); ok {
+	if v, ok := tfMap["source_kafka_cluster_id"].(string); ok && v != "" {
+		apiObject.SourceKafkaClusterId = aws.String(v)
+	}
+
+	if v, ok := tfMap["target_kafka_cluster_arn"].(string); ok && v != "" {
 		apiObject.TargetKafkaClusterArn = aws.String(v)
+	}
+
+	if v, ok := tfMap["target_kafka_cluster_id"].(string); ok && v != "" {
+		apiObject.TargetKafkaClusterId = aws.String(v)
 	}
 
 	if v, ok := tfMap["target_compression_type"].(string); ok {
@@ -1121,6 +1378,18 @@ func expandKafkaCluster(tfMap map[string]any) types.KafkaCluster { // nosemgrep:
 		apiObject.AmazonMskCluster = expandAmazonMSKCluster(v[0].(map[string]any))
 	}
 
+	if v, ok := tfMap["apache_kafka_cluster"].([]any); ok && len(v) > 0 && v[0] != nil {
+		apiObject.ApacheKafkaCluster = expandApacheKafkaCluster(v[0].(map[string]any))
+	}
+
+	if v, ok := tfMap["client_authentication"].([]any); ok && len(v) > 0 && v[0] != nil {
+		apiObject.ClientAuthentication = expandKafkaClusterClientAuthentication(v[0].(map[string]any))
+	}
+
+	if v, ok := tfMap["encryption_in_transit"].([]any); ok && len(v) > 0 && v[0] != nil {
+		apiObject.EncryptionInTransit = expandKafkaClusterEncryptionInTransit(v[0].(map[string]any))
+	}
+
 	return apiObject
 }
 
@@ -1143,6 +1412,52 @@ func expandAmazonMSKCluster(tfMap map[string]any) *types.AmazonMskCluster { // n
 
 	if v, ok := tfMap["msk_cluster_arn"].(string); ok && v != "" {
 		apiObject.MskClusterArn = aws.String(v)
+	}
+
+	return apiObject
+}
+
+func expandApacheKafkaCluster(tfMap map[string]any) *types.ApacheKafkaCluster {
+	apiObject := &types.ApacheKafkaCluster{}
+
+	if v, ok := tfMap["apache_kafka_cluster_id"].(string); ok && v != "" {
+		apiObject.ApacheKafkaClusterId = aws.String(v)
+	}
+
+	if v, ok := tfMap["bootstrap_broker_string"].(string); ok && v != "" {
+		apiObject.BootstrapBrokerString = aws.String(v)
+	}
+
+	return apiObject
+}
+
+func expandKafkaClusterClientAuthentication(tfMap map[string]any) *types.KafkaClusterClientAuthentication { // nosemgrep:ci.kafka-in-func-name
+	apiObject := &types.KafkaClusterClientAuthentication{}
+
+	if v, ok := tfMap["sasl_scram"].([]any); ok && len(v) > 0 && v[0] != nil {
+		scram := v[0].(map[string]any)
+		apiObject.SaslScram = &types.KafkaClusterSaslScramAuthentication{}
+		if m, ok := scram["mechanism"].(string); ok && m != "" {
+			apiObject.SaslScram.Mechanism = types.KafkaClusterSaslScramMechanism(m)
+		}
+
+		if s, ok := scram["secret_arn"].(string); ok && s != "" {
+			apiObject.SaslScram.SecretArn = aws.String(s)
+		}
+	}
+
+	return apiObject
+}
+
+func expandKafkaClusterEncryptionInTransit(tfMap map[string]any) *types.KafkaClusterEncryptionInTransit { // nosemgrep:ci.kafka-in-func-name
+	apiObject := &types.KafkaClusterEncryptionInTransit{}
+
+	if v, ok := tfMap["encryption_type"].(string); ok && v != "" {
+		apiObject.EncryptionType = types.KafkaClusterEncryptionInTransitType(v)
+	}
+
+	if v, ok := tfMap["root_ca_certificate"].(string); ok && v != "" {
+		apiObject.RootCaCertificate = aws.String(v)
 	}
 
 	return apiObject

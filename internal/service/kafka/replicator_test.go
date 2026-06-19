@@ -1045,3 +1045,307 @@ resource "aws_msk_replicator" "test" {
 }
 `, rName))
 }
+
+func TestAccKafkaReplicator_apacheKafkaCluster_bothApacheError(t *testing.T) {
+	ctx := acctest.Context(t)
+
+	if testing.Short() {
+		t.Skip("skipping long-running test in short mode")
+	}
+
+	rName := acctest.RandomWithPrefix(t, acctest.ResourcePrefix)
+	sourceCluster := acctest.RandomWithPrefix(t, acctest.ResourcePrefix)
+	targetCluster := acctest.RandomWithPrefix(t, acctest.ResourcePrefix)
+
+	acctest.ParallelTest(ctx, t, resource.TestCase{
+		PreCheck: func() {
+			acctest.PreCheck(ctx, t)
+			acctest.PreCheckPartitionHasService(t, names.Kafka)
+			testAccPreCheck(ctx, t)
+		},
+		ErrorCheck:               acctest.ErrorCheck(t, names.Kafka),
+		ProtoV5ProviderFactories: acctest.ProtoV5ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config:      testAccReplicatorConfig_apacheKafkaClusterBothApache(rName, sourceCluster, targetCluster),
+				ExpectError: regexache.MustCompile(`at least one kafka_cluster must be an amazon_msk_cluster`),
+			},
+		},
+	})
+}
+
+func testAccReplicatorConfig_apacheKafkaClusterBothApache(rName, sourceCluster, targetCluster string) string {
+	return acctest.ConfigCompose(
+		testAccReplicatorConfig_source(sourceCluster),
+		testAccReplicatorConfig_target(targetCluster),
+		fmt.Sprintf(`
+resource "aws_secretsmanager_secret" "test" {
+  name = %[1]q
+}
+
+resource "aws_msk_replicator" "test" {
+  replicator_name            = %[1]q
+  description                = "test-both-apache"
+  service_execution_role_arn = aws_iam_role.source.arn
+
+  kafka_cluster {
+    apache_kafka_cluster {
+      apache_kafka_cluster_id = "external-cluster-1"
+      bootstrap_broker_string = "broker1.example.com:9096"
+    }
+
+    client_authentication {
+      sasl_scram {
+        mechanism  = "SCRAM_SHA_512"
+        secret_arn = aws_secretsmanager_secret.test.arn
+      }
+    }
+
+    encryption_in_transit {
+      encryption_type = "TLS"
+    }
+
+    vpc_config {
+      subnet_ids          = aws_subnet.source[*].id
+      security_groups_ids = [aws_security_group.source.id]
+    }
+  }
+
+  kafka_cluster {
+    apache_kafka_cluster {
+      apache_kafka_cluster_id = "external-cluster-2"
+      bootstrap_broker_string = "broker2.example.com:9096"
+    }
+
+    client_authentication {
+      sasl_scram {
+        mechanism  = "SCRAM_SHA_512"
+        secret_arn = aws_secretsmanager_secret.test.arn
+      }
+    }
+
+    encryption_in_transit {
+      encryption_type = "TLS"
+    }
+
+    vpc_config {
+      subnet_ids          = aws_subnet.target[*].id
+      security_groups_ids = [aws_security_group.target.id]
+    }
+  }
+
+  replication_info_list {
+    source_kafka_cluster_id = "external-cluster-1"
+    target_kafka_cluster_id = "external-cluster-2"
+    target_compression_type = "NONE"
+
+    topic_replication {
+      topics_to_replicate = [".*"]
+    }
+
+    consumer_group_replication {
+      consumer_groups_to_replicate = [".*"]
+    }
+  }
+}
+`, rName))
+}
+
+func TestAccKafkaReplicator_apacheKafkaCluster_missingAuth(t *testing.T) {
+	ctx := acctest.Context(t)
+	if testing.Short() {
+		t.Skip("skipping long-running test in short mode")
+	}
+
+	rName := acctest.RandomWithPrefix(t, acctest.ResourcePrefix)
+	sourceCluster := acctest.RandomWithPrefix(t, acctest.ResourcePrefix)
+	targetCluster := acctest.RandomWithPrefix(t, acctest.ResourcePrefix)
+
+	acctest.ParallelTest(ctx, t, resource.TestCase{
+		PreCheck: func() {
+			acctest.PreCheck(ctx, t)
+			acctest.PreCheckPartitionHasService(t, names.Kafka)
+			testAccPreCheck(ctx, t)
+		},
+		ErrorCheck:               acctest.ErrorCheck(t, names.Kafka),
+		ProtoV5ProviderFactories: acctest.ProtoV5ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config:      testAccReplicatorConfig_apacheKafkaClusterMissingAuth(rName, sourceCluster, targetCluster),
+				ExpectError: regexache.MustCompile(`requires client_authentication when using apache_kafka_cluster`),
+			},
+		},
+	})
+}
+
+func testAccReplicatorConfig_apacheKafkaClusterMissingAuth(rName, sourceCluster, targetCluster string) string {
+	return acctest.ConfigCompose(
+		testAccReplicatorConfig_source(sourceCluster),
+		testAccReplicatorConfig_target(targetCluster),
+		fmt.Sprintf(`
+resource "aws_msk_replicator" "test" {
+  replicator_name            = %[1]q
+  description                = "test-missing-auth"
+  service_execution_role_arn = aws_iam_role.source.arn
+
+  kafka_cluster {
+    amazon_msk_cluster {
+      msk_cluster_arn = aws_msk_cluster.source.arn
+    }
+
+    vpc_config {
+      subnet_ids          = aws_subnet.source[*].id
+      security_groups_ids = [aws_security_group.source.id]
+    }
+  }
+
+  kafka_cluster {
+    apache_kafka_cluster {
+      apache_kafka_cluster_id = "external-cluster-id"
+      bootstrap_broker_string = "broker1.example.com:9096"
+    }
+
+    vpc_config {
+      subnet_ids          = aws_subnet.target[*].id
+      security_groups_ids = [aws_security_group.target.id]
+    }
+  }
+
+  replication_info_list {
+    source_kafka_cluster_arn = aws_msk_cluster.source.arn
+    target_kafka_cluster_id  = "external-cluster-id"
+    target_compression_type  = "NONE"
+
+    topic_replication {
+      topics_to_replicate = [".*"]
+    }
+
+    consumer_group_replication {
+      consumer_groups_to_replicate = [".*"]
+    }
+  }
+}
+`, rName))
+}
+
+func TestAccKafkaReplicator_apacheKafkaCluster(t *testing.T) {
+	ctx := acctest.Context(t)
+	if testing.Short() {
+		t.Skip("skipping long-running test in short mode")
+	}
+
+	var replicator kafka.DescribeReplicatorOutput
+	rName := acctest.RandomWithPrefix(t, acctest.ResourcePrefix)
+	sourceCluster := acctest.RandomWithPrefix(t, acctest.ResourcePrefix)
+	targetCluster := acctest.RandomWithPrefix(t, acctest.ResourcePrefix)
+	resourceName := "aws_msk_replicator.test"
+
+	acctest.ParallelTest(ctx, t, resource.TestCase{
+		PreCheck: func() {
+			acctest.PreCheck(ctx, t)
+			acctest.PreCheckPartitionHasService(t, names.Kafka)
+			testAccPreCheck(ctx, t)
+		},
+		ErrorCheck:               acctest.ErrorCheck(t, names.Kafka),
+		ProtoV5ProviderFactories: acctest.ProtoV5ProviderFactories,
+		CheckDestroy:             testAccCheckReplicatorDestroy(ctx, t),
+		Steps: []resource.TestStep{
+			{
+				Config: testAccReplicatorConfig_apacheKafkaCluster(rName, sourceCluster, targetCluster),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					testAccCheckReplicatorExists(ctx, t, resourceName, &replicator),
+					resource.TestCheckResourceAttr(resourceName, "replicator_name", rName),
+					resource.TestCheckResourceAttr(resourceName, "kafka_cluster.#", "2"),
+					resource.TestCheckResourceAttr(resourceName, "kafka_cluster.0.amazon_msk_cluster.#", "1"),
+					resource.TestCheckResourceAttr(resourceName, "kafka_cluster.1.apache_kafka_cluster.#", "1"),
+					resource.TestCheckResourceAttr(resourceName, "kafka_cluster.1.client_authentication.#", "1"),
+					resource.TestCheckResourceAttr(resourceName, "kafka_cluster.1.encryption_in_transit.#", "1"),
+					resource.TestCheckResourceAttr(resourceName, "kafka_cluster.1.encryption_in_transit.0.encryption_type", "TLS"),
+					resource.TestCheckResourceAttr(resourceName, "replication_info_list.0.target_compression_type", "NONE"),
+					resource.TestCheckResourceAttr(resourceName, "replication_info_list.0.topic_replication.0.topics_to_replicate.#", "1"),
+					resource.TestCheckResourceAttr(resourceName, "replication_info_list.0.consumer_group_replication.0.consumer_groups_to_replicate.#", "1"),
+				),
+			},
+			{
+				ResourceName:      resourceName,
+				ImportState:       true,
+				ImportStateVerify: true,
+			},
+		},
+	})
+}
+
+func testAccReplicatorConfig_apacheKafkaCluster(rName, sourceCluster, targetCluster string) string {
+	return acctest.ConfigCompose(
+		testAccReplicatorConfig_source(sourceCluster),
+		testAccReplicatorConfig_target(targetCluster),
+		fmt.Sprintf(`
+resource "aws_secretsmanager_secret" "test" {
+  name = %[1]q
+}
+
+resource "aws_secretsmanager_secret_version" "test" {
+  secret_id = aws_secretsmanager_secret.test.id
+  secret_string = jsonencode({
+    username = "testuser"
+    password = "testpassword"
+  })
+}
+
+resource "aws_msk_replicator" "test" {
+  replicator_name            = %[1]q
+  description                = "test-apache-kafka-cluster"
+  service_execution_role_arn = aws_iam_role.source.arn
+
+  kafka_cluster {
+    amazon_msk_cluster {
+      msk_cluster_arn = aws_msk_cluster.source.arn
+    }
+
+    vpc_config {
+      subnet_ids          = aws_subnet.source[*].id
+      security_groups_ids = [aws_security_group.source.id]
+    }
+  }
+
+  kafka_cluster {
+    apache_kafka_cluster {
+      apache_kafka_cluster_id = "external-cluster-id"
+      bootstrap_broker_string = "broker1.example.com:9096,broker2.example.com:9096"
+    }
+
+    client_authentication {
+      sasl_scram {
+        mechanism  = "SCRAM_SHA_512"
+        secret_arn = aws_secretsmanager_secret.test.arn
+      }
+    }
+
+    encryption_in_transit {
+      encryption_type = "TLS"
+    }
+
+    vpc_config {
+      subnet_ids          = aws_subnet.target[*].id
+      security_groups_ids = [aws_security_group.target.id]
+    }
+  }
+
+  replication_info_list {
+    source_kafka_cluster_arn = aws_msk_cluster.source.arn
+    target_kafka_cluster_id  = "external-cluster-id"
+    target_compression_type  = "NONE"
+
+    topic_replication {
+      topics_to_replicate = [".*"]
+    }
+
+    consumer_group_replication {
+      consumer_groups_to_replicate = [".*"]
+    }
+  }
+
+  depends_on = [aws_secretsmanager_secret_version.test]
+}
+`, rName))
+}
